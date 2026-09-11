@@ -1,18 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"image"
-	"image/color"
-	"image/png"
-	"bytes"
 	"syscall"
 	"time"
 
@@ -22,14 +22,14 @@ import (
 
 // 定义请求和响应结构
 type GenerateRequest struct {
-	Prompt            string  `json:"prompt"`
-	NegativePrompt    string  `json:"negative_prompt"`
-	Width             int     `json:"width"`
-	Height            int     `json:"height"`
-	Seed              int64   `json:"seed"`
-	Steps             int     `json:"steps"`
-	GuidanceScale     float32 `json:"guidance_scale"`
-	BatchCount        int     `json:"batch_count"`
+	Prompt         string  `json:"prompt"`
+	NegativePrompt string  `json:"negative_prompt"`
+	Width          int     `json:"width"`
+	Height         int     `json:"height"`
+	Seed           int64   `json:"seed"`
+	Steps          int     `json:"steps"`
+	GuidanceScale  float32 `json:"guidance_scale"`
+	BatchCount     int     `json:"batch_count"`
 }
 
 type GenerateResponse struct {
@@ -211,7 +211,7 @@ func main() {
 	// 注册路由
 	mux.HandleFunc("/health", healthCheckHandler)
 	mux.HandleFunc("/system-info", systemInfoHandler)
-	
+
 	// 给生成接口加上超时机制
 	generateTimeout := 5 * time.Minute
 	if t := os.Getenv("GENERATE_TIMEOUT"); t != "" {
@@ -219,7 +219,7 @@ func main() {
 			generateTimeout = d
 		}
 	}
-	
+
 	generateTimeoutHandler := http.TimeoutHandler(http.HandlerFunc(generateHandler), generateTimeout, `{"error":"Generation timeout"}`)
 	mux.Handle("/generate", generateTimeoutHandler)
 
@@ -255,10 +255,13 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
-	// 释放模型资源
+	// 释放模型资源。Close 后不得再调用 GenerateImage；
+	// srv.Shutdown 已保证所有在途请求结束，因此没有并发生成。
 	if sdCtx != nil {
-		log.Println("Freeing stable-diffusion context...")
-		sdCtx.Free()
+		log.Println("Closing stable-diffusion context...")
+		if err := sdCtx.Close(); err != nil {
+			log.Printf("Error closing context: %v", err)
+		}
 	}
 
 	log.Println("Server exiting")

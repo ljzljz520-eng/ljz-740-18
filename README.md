@@ -111,7 +111,7 @@ func main() {
     if err != nil {
         log.Fatalf("Failed to create context: %v", err)
     }
-    defer ctx.Free()
+    defer ctx.Close() // Close 之后不得再生成，否则返回 stablediffusion.ErrClosed
 
     // 图像生成
     cfg := stablediffusion.GenerationConfig{
@@ -135,15 +135,68 @@ func main() {
 }
 ```
 
+### 内存与生命周期约定（C 指针 / Go 内存交互）
+
+绑定底层是 C 动态库，所有跨边界资源遵循以下规则：
+
+**1. 传给底层的字符串、图像缓冲、结构体数组**
+
+- Go 字符串会转成带 NUL 的临时缓冲（Go 堆内存），**只在同步 C 调用期间**
+  借给底层；高层 API 内部用 `runtime.KeepAlive` 保证调用期间不被 GC。
+  调用返回后底层不再持有这些指针，由 Go GC 回收，**切勿**对它们调用
+  `FreeCPtr`。
+- 输入图像（`InitImage`/`MaskImage`/`ControlImage`/`RefImages`/控制帧等）
+  的 `Data` 在生成调用返回前必须有效，且**不能从其他 goroutine 并发改写**；
+  `PreprocessCanny` 会**原地写回**缓冲。空缓冲/尺寸不匹配会在进入 C 之前报错，
+  不会对空切片取指针。
+- LoRA、参考帧等 Go 结构体切片同样在调用期间整体保活。
+
+**2. 底层返回的资源由谁释放**
+
+| C 资源 | Go 侧释放方式 |
+|--------|--------------|
+| `generate_image` 返回的数组 + 每帧 `data` | `GenerateImage` 内部拷贝后自动释放 |
+| `generate_video` 返回的数组 + 每帧 `data` | `GenerateVideo` 内部拷贝后自动释放 |
+| `upscale` 返回的 `data` | `Upscale` 内部拷贝后自动释放 |
+| `*_params_to_str` 返回的字符串 | `SdCtxParamsToStr` 等转成 Go 字符串后自动释放 |
+| `new_sd_ctx` / `new_upscaler_ctx` | `Context.Close()` / `Upscaler.Close()` |
+
+即使**生成失败**（返回 nil、帧数为 0 或部分帧为空），已从底层拿到的资源
+也会被释放，不会泄漏。底层 `bindings` 层额外导出 `FreeCPtr` /
+`FreeImageData` / `FreeImageArray`，仅用于直接使用底层 API 的场景——
+它们只能接收 **C malloc 的内存**，不能传 Go 指针。
+
+**3. Close 之后禁止继续生成**
+
+`Close()` 会释放底层上下文（C 侧为 `free`，之后是悬空指针）。Close 后再调用
+`GenerateImage`/`GenerateVideo`/`Upscale` 等会返回
+`stablediffusion.ErrClosed`，而不会进入 C 层造成 use-after-free。同一
+Context/Upscaler 的生成调用由内部互斥锁串行化；`Close` 可重复调用。
+旧的 `Free()` 仍保留为 `Close()` 的弃用别名。
+
+**4. 回调及上下文（data）生命周期**
+
+回调是**进程级全局**的（C 侧静态变量，与具体 Context 无关）：
+
+- 推荐使用 `stablediffusion.OnLog` / `OnProgress` / `OnPreview`
+  或 `bindings.RegisterLogCallback` 等，它们用 `runtime/cgo.Handle`
+  管理任意 Go 上下文并保活，返回的 `CallbackRegistration` 调用 `Release()`
+  即注销并释放上下文；
+- 预览回调里的 `frames` 只在**本次回调执行期间**有效，需保留请用
+  `CopyPreviewFrame(s)` 深拷贝，不能自行 free；
+- 直接使用 `SetLogCallback(cb, data unsafe.Pointer)` 时，调用方必须自行
+  保证 `data` 指向的对象在注销前存活，且不要在热路径反复注册
+  （回调蹦床数量有上限且不释放）。注销用 `UnsetLogCallback` 等。
+
 ### 完整 API 清单
 
 对比 `stable-diffusion.h` 全部 38 个导出函数，以下是绑定覆盖状态：
 
 | C 函数 | Go 绑定 (bindings) | 高层 API (stablediffusion) |
 |--------|-------|-----------|
-| `sd_set_log_callback` | `SetLogCallback` | `SetLogCallback` |
-| `sd_set_progress_callback` | `SetProgressCallback` | `SetProgressCallback` |
-| `sd_set_preview_callback` | `SetPreviewCallback` | `SetPreviewCallback` |
+| `sd_set_log_callback` | `SetLogCallback` / `RegisterLogCallback` / `UnsetLogCallback` | `SetLogCallback`(弃用) / `OnLog` |
+| `sd_set_progress_callback` | `SetProgressCallback` / `RegisterProgressCallback` / `UnsetProgressCallback` | `SetProgressCallback`(弃用) / `OnProgress` |
+| `sd_set_preview_callback` | `SetPreviewCallback` / `RegisterPreviewCallback` / `UnsetPreviewCallback` | `SetPreviewCallback`(弃用) / `OnPreview` |
 | `sd_get_num_physical_cores` | `GetNumPhysicalCores` | `GetNumPhysicalCores` |
 | `sd_get_system_info` | `GetSystemInfo` | `GetSystemInfo` |
 | `sd_type_name` | `GetTypeName` | `GetTypeName` |
@@ -164,7 +217,7 @@ func main() {
 | `sd_ctx_params_init` | `SdCtxParamsInit` | ✅ 内部使用 |
 | `sd_ctx_params_to_str` | `SdCtxParamsToStr` | ✅ 调试用 |
 | `new_sd_ctx` | `CreateSdCtx` | `NewContext` |
-| `free_sd_ctx` | `FreeSdCtx` | `Context.Free` |
+| `free_sd_ctx` | `FreeSdCtx` | `Context.Close`（`Free` 为弃用别名） |
 | `sd_sample_params_init` | `SdSampleParamsInit` | ✅ 内部使用 |
 | `sd_sample_params_to_str` | `SdSampleParamsToStr` | ✅ 调试用 |
 | `sd_get_default_sample_method` | `GetDefaultSampleMethod` | `Context.GetDefaultSampleMethod` |
@@ -175,7 +228,7 @@ func main() {
 | `sd_vid_gen_params_init` | `SdVidGenParamsInit` | ✅ 内部使用 |
 | `generate_video` | `GenerateVideo` | `Context.GenerateVideo` |
 | `new_upscaler_ctx` | `CreateUpscalerCtx` | `NewUpscaler` |
-| `free_upscaler_ctx` | `FreeUpscalerCtx` | `Upscaler.Free` |
+| `free_upscaler_ctx` | `FreeUpscalerCtx` | `Upscaler.Close`（`Free` 为弃用别名） |
 | `upscale` | `Upscale` | `Upscaler.Upscale` |
 | `get_upscale_factor` | `GetUpscaleFactor` | `Upscaler.GetUpscaleFactor` |
 | `convert` | `Convert` | `ConvertModel` |
@@ -212,8 +265,11 @@ func main() {
 | 1.1 | `TestCStringGoString` | Go↔C 字符串转换含 NULL 终止符 | 字符串相等，NULL 存在 |
 | 1.2 | `TestMockImplementation` | 无动态库时自动降级到 Mock | `GetSystemInfo()`/`GetVersion()` 返回非空 |
 | 1.3 | `TestCallbackWrapper` | `purego.NewCallback` 包装不被 GC 回收 | `currentLogCallback != 0` |
+| 1.4 | `TestBytePtr` / `TestFreeInMockModeIsNoop` | 空切片返回 nil；mock 下释放 C 资源为空操作 | 不 panic、不崩溃 |
+| 1.5 | `TestParamsToStrFreesCBuffer` | `*_ToStr` 返回 Go 字符串且内部释放 C 缓冲 | 内容正确 |
+| 1.6 | `TestRegisterCallbackWithContext` / `TestUnsetCallbacks` | `cgo.Handle` 上下文保活、`Release` 幂等、可注销 | 不 panic |
 
-### 高层 API 层 (`test/`)
+### 高层 API 层 (`test/` 及包内生命周期测试)
 
 | # | 测试名称 | 验证内容 | 预期结果 |
 |---|----------|----------|----------|
@@ -223,6 +279,9 @@ func main() {
 | 2.4 | `TestCreateUpscaler` | `NewUpscaler` 无模型文件时 | 返回 `error` |
 | 2.5 | `TestConvertModel` | `ConvertModel` 无文件时 | 返回 `error` |
 | 2.6 | `TestImageGenerationConfig` | `GenerationConfig` 结构体初始化 | `Width=512`, `Height=512` |
+| 2.7 | `TestClosedContextRejectsGeneration` | Close/零值上下文再生成 | 返回 `ErrClosed`，不进 C 层 |
+| 2.8 | `TestClosedUpscalerRejectsUpscale` | Close/零值 Upscaler 再超分 | 返回 `ErrClosed` |
+| 2.9 | `TestImageValidation` / `TestCannyValidation` | nil/尺寸与缓冲不符的输入 | 进入 C 之前报错 |
 
 ### 运行所有测试
 
